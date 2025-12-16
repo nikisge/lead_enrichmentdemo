@@ -20,14 +20,17 @@ async def enrich_lead(
     skip_paid_apis: bool = False
 ) -> EnrichmentResult:
     """
-    Main enrichment pipeline - OPTIMIZED FLOW.
+    Main enrichment pipeline - OPTIMIZED FLOW v2.
 
     Flow:
     1. LLM Parse → Extract contact name, company, email from job posting
-    2. Google LinkedIn Search → Find LinkedIn URL (FREE with Google API)
-    3. Kaspr (if LinkedIn found) → Phone + Emails (best EU data, 1 credit)
-    4. FullEnrich (if no phone yet) → Email + LinkedIn URL (10 credits/phone)
-    5. Impressum Scraping → Free fallback for company phone
+    2. Decision Maker Discovery → If no contact found, search for executives
+       - Apollo Free Search (no credits!)
+       - Google Decision Maker Search (FREE!)
+    3. Google LinkedIn Search → Find LinkedIn URL (FREE with Google API)
+    4. FullEnrich → Try to get phone FIRST (10 credits/phone, but saves Kaspr)
+    5. Kaspr (fallback) → If no phone yet + have LinkedIn (1 credit)
+    6. Impressum Scraping → Free fallback for company phone
 
     Args:
         payload: Job posting data
@@ -72,9 +75,40 @@ async def enrich_lead(
         enrichment_path.append("contact_from_posting")
         logger.info(f"Contact from posting: {parsed.contact_name}")
 
+    # Step 2b: Decision Maker Discovery - If NO contact in job posting, find one!
+    # Priority: HR/Recruiting > Job-relevant dept head > General executive
+    if not decision_maker and parsed.company_name:
+        logger.info("No contact in job posting - searching for decision maker...")
+        logger.info(f"Job category: {payload.category}")
+
+        # Google Decision Maker Search (FREE!) - with job category for smart prioritization
+        linkedin_client = LinkedInSearchClient()
+
+        dm_result = await linkedin_client.find_decision_maker(
+            company=parsed.company_name,
+            domain=parsed.company_domain,
+            job_category=payload.category  # Pass category for relevant dept head search
+        )
+
+        if dm_result:
+            names = dm_result["name"].split()
+            first_name = names[0] if names else ""
+            last_name = " ".join(names[1:]) if len(names) > 1 else ""
+
+            decision_maker = DecisionMaker(
+                name=dm_result["name"],
+                first_name=first_name,
+                last_name=last_name,
+                title=dm_result.get("title"),
+                linkedin_url=dm_result.get("linkedin_url")
+            )
+            linkedin_url = dm_result.get("linkedin_url")
+            enrichment_path.append("google_dm_search")
+            logger.info(f"Google found decision maker: {dm_result['name']} ({dm_result.get('title')})")
+
     # Step 3: Google LinkedIn Search - Find LinkedIn profile (FREE!)
-    # This replaces Apollo which requires paid plan
-    if not skip_paid_apis and decision_maker and not linkedin_url:
+    # Only if we have a name but no LinkedIn URL yet
+    if decision_maker and not linkedin_url:
         logger.info("Searching LinkedIn via Google...")
         linkedin_client = LinkedInSearchClient()
 
@@ -90,12 +124,45 @@ async def enrich_lead(
             enrichment_path.append("google_linkedin_found")
             logger.info(f"Google found LinkedIn: {linkedin_url}")
 
-    # Step 4: Kaspr - If we have LinkedIn URL, get phone (best EU data!)
-    # Kaspr: 1 credit per request, UNLIMITED emails
+    # Step 4: FullEnrich FIRST - Try to get phone before using Kaspr
+    # FullEnrich: 10 credits/phone, but saves Kaspr credits
     phone_result: Optional[PhoneResult] = None
 
-    if not skip_paid_apis and linkedin_url:
-        logger.info(f"Trying Kaspr with LinkedIn: {linkedin_url}")
+    if not skip_paid_apis and decision_maker and decision_maker.first_name and decision_maker.last_name:
+        logger.info("Trying FullEnrich FIRST (saves Kaspr credits)...")
+        fullenrich = FullEnrichClient()
+
+        fe_result = await fullenrich.enrich(
+            first_name=decision_maker.first_name,
+            last_name=decision_maker.last_name,
+            company_name=parsed.company_name,
+            domain=parsed.company_domain,
+            linkedin_url=linkedin_url
+        )
+
+        if fe_result:
+            enrichment_path.append("fullenrich")
+            collected_emails.extend(fe_result.emails)
+
+            # Check if FullEnrich found LinkedIn (if we didn't have it)
+            if not linkedin_url and fe_result.linkedin_url:
+                linkedin_url = fe_result.linkedin_url
+                decision_maker.linkedin_url = linkedin_url
+                enrichment_path.append("fullenrich_linkedin_found")
+                logger.info(f"FullEnrich found LinkedIn: {linkedin_url}")
+
+            # Check if FullEnrich found phones
+            if fe_result.phones:
+                phone_result = _get_best_phone(fe_result.phones)
+                enrichment_path.append("fullenrich_phone_found")
+                logger.info(f"FullEnrich found phone: {phone_result.number}")
+
+            logger.info(f"FullEnrich: {len(fe_result.emails)} emails, {len(fe_result.phones)} phones")
+
+    # Step 5: Kaspr - FALLBACK if no phone yet and we have LinkedIn
+    # Kaspr: 1 credit per request, UNLIMITED emails
+    if not skip_paid_apis and not phone_result and linkedin_url:
+        logger.info(f"No phone yet - trying Kaspr with LinkedIn: {linkedin_url}")
         kaspr = KasprClient()
 
         kaspr_result = await kaspr.enrich_by_linkedin(
@@ -114,52 +181,6 @@ async def enrich_lead(
                 logger.info(f"Kaspr found phone: {phone_result.number} ({phone_result.type.value})")
 
             logger.info(f"Kaspr: {len(kaspr_result.emails)} emails, {len(kaspr_result.phones)} phones")
-
-    # Step 5: FullEnrich - If no phone yet, try with Name + Company
-    # FullEnrich: 1 credit/email, 10 credits/phone
-    if not skip_paid_apis and not phone_result and decision_maker and decision_maker.first_name and decision_maker.last_name:
-        logger.info("Trying FullEnrich (Name + Company)...")
-        fullenrich = FullEnrichClient()
-
-        fe_result = await fullenrich.enrich(
-            first_name=decision_maker.first_name,
-            last_name=decision_maker.last_name,
-            company_name=parsed.company_name,
-            domain=parsed.company_domain,
-            linkedin_url=linkedin_url  # Pass LinkedIn if we have it
-        )
-
-        if fe_result:
-            enrichment_path.append("fullenrich")
-            collected_emails.extend(fe_result.emails)
-
-            # If we didn't have LinkedIn yet, check if FullEnrich found it
-            if not linkedin_url and fe_result.linkedin_url:
-                linkedin_url = fe_result.linkedin_url
-                decision_maker.linkedin_url = linkedin_url
-                enrichment_path.append("fullenrich_linkedin_found")
-                logger.info(f"FullEnrich found LinkedIn: {linkedin_url}")
-
-                # Try Kaspr again with the new LinkedIn URL
-                if not phone_result:
-                    logger.info("Retrying Kaspr with FullEnrich LinkedIn...")
-                    kaspr = KasprClient()
-                    kaspr_result = await kaspr.enrich_by_linkedin(
-                        linkedin_url=linkedin_url,
-                        name=decision_maker.name
-                    )
-                    if kaspr_result and kaspr_result.phones:
-                        phone_result = _get_best_phone(kaspr_result.phones)
-                        enrichment_path.append("kaspr_phone_found")
-                        collected_emails.extend(kaspr_result.emails)
-
-            # Check if FullEnrich found phones directly
-            if not phone_result and fe_result.phones:
-                phone_result = _get_best_phone(fe_result.phones)
-                enrichment_path.append("fullenrich_phone_found")
-                logger.info(f"FullEnrich found phone: {phone_result.number}")
-
-            logger.info(f"FullEnrich: {len(fe_result.emails)} emails, {len(fe_result.phones)} phones")
 
     # Step 6: Impressum Scraping - FREE fallback for company phone
     if not phone_result:
