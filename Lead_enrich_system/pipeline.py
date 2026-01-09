@@ -159,10 +159,17 @@ async def enrich_lead(
 
             logger.info(f"FullEnrich: {len(fe_result.emails)} emails, {len(fe_result.phones)} phones")
 
-    # Step 5: Kaspr - FALLBACK if no phone yet and we have LinkedIn
+    # Step 5: Kaspr - Try if no phone OR only landline found
     # Kaspr: 1 credit per request, UNLIMITED emails
-    if not skip_paid_apis and not phone_result and linkedin_url:
-        logger.info(f"No phone yet - trying Kaspr with LinkedIn: {linkedin_url}")
+    # We want mobile numbers, so try Kaspr even if we have a landline
+    need_kaspr = (
+        not phone_result or
+        (phone_result and phone_result.type == PhoneType.LANDLINE)
+    )
+
+    if not skip_paid_apis and need_kaspr and linkedin_url:
+        reason = "no phone yet" if not phone_result else "only landline found, trying for mobile"
+        logger.info(f"Trying Kaspr ({reason}) with LinkedIn: {linkedin_url}")
         kaspr = KasprClient()
 
         kaspr_result = await kaspr.enrich_by_linkedin(
@@ -176,9 +183,17 @@ async def enrich_lead(
             collected_emails.extend(kaspr_result.emails)
 
             if kaspr_result.phones:
-                phone_result = _get_best_phone(kaspr_result.phones)
-                enrichment_path.append("kaspr_phone_found")
-                logger.info(f"Kaspr found phone: {phone_result.number} ({phone_result.type.value})")
+                kaspr_phone = _get_best_phone(kaspr_result.phones)
+                # If Kaspr found mobile and we only had landline, prefer mobile
+                if kaspr_phone:
+                    if not phone_result:
+                        phone_result = kaspr_phone
+                        enrichment_path.append("kaspr_phone_found")
+                    elif kaspr_phone.type == PhoneType.MOBILE and phone_result.type != PhoneType.MOBILE:
+                        logger.info(f"Kaspr found mobile, replacing landline")
+                        phone_result = kaspr_phone
+                        enrichment_path.append("kaspr_mobile_upgrade")
+                    logger.info(f"Kaspr found phone: {kaspr_phone.number} ({kaspr_phone.type.value})")
 
             logger.info(f"Kaspr: {len(kaspr_result.emails)} emails, {len(kaspr_result.phones)} phones")
 

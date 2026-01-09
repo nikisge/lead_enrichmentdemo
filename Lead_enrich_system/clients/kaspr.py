@@ -73,8 +73,11 @@ class KasprClient:
                 phones = []
                 emails = []
 
-                # Extract phones
-                phone_data = data.get("phones", [])
+                # Kaspr API returns data in "profile" object
+                profile = data.get("profile", data)
+
+                # Extract phones from profile
+                phone_data = profile.get("phones", [])
                 if isinstance(phone_data, list):
                     for phone in phone_data:
                         if isinstance(phone, dict):
@@ -94,24 +97,34 @@ class KasprClient:
                                 source=PhoneSource.KASPR
                             ))
 
-                # Also check for single phone field
-                if not phones and data.get("phone"):
-                    phones.append(PhoneResult(
-                        number=data["phone"],
-                        type=self._determine_phone_type("", data["phone"]),
-                        source=PhoneSource.KASPR
-                    ))
+                # Also check for starryPhone field (single best phone)
+                if not phones and profile.get("starryPhone"):
+                    starry = profile["starryPhone"]
+                    if isinstance(starry, str):
+                        phones.append(PhoneResult(
+                            number=starry,
+                            type=self._determine_phone_type("", starry),
+                            source=PhoneSource.KASPR
+                        ))
 
-                # Extract emails
-                if data.get("workEmail"):
-                    emails.append(data["workEmail"])
-                if data.get("directEmail"):
-                    emails.append(data["directEmail"])
-                if data.get("email"):
-                    emails.append(data["email"])
+                # Extract emails from profile
+                # Check starryWorkEmail (best work email)
+                if profile.get("starryWorkEmail"):
+                    emails.append(profile["starryWorkEmail"])
+                # Check starryDirectEmail (best personal email)
+                if profile.get("starryDirectEmail"):
+                    emails.append(profile["starryDirectEmail"])
+                # Check workEmails array
+                work_emails = profile.get("workEmails", [])
+                if isinstance(work_emails, list):
+                    emails.extend(work_emails)
+                # Check directEmails array
+                direct_emails = profile.get("directEmails", [])
+                if isinstance(direct_emails, list):
+                    emails.extend(direct_emails)
 
-                # Also check emails array
-                email_data = data.get("emails", [])
+                # Also check emails array (with email objects)
+                email_data = profile.get("emails", [])
                 if isinstance(email_data, list):
                     for email in email_data:
                         if isinstance(email, dict):
