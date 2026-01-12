@@ -1,6 +1,11 @@
 import logging
+import re
 from typing import Optional, List
+from urllib.parse import urlparse
 
+import httpx
+
+from config import get_settings
 from models import (
     WebhookPayload, EnrichmentResult, CompanyInfo, CompanyIntel,
     DecisionMaker, PhoneResult, PhoneSource, PhoneType
@@ -15,22 +20,70 @@ from clients.company_research import CompanyResearcher
 logger = logging.getLogger(__name__)
 
 
+def _is_valid_dach_phone(number: str) -> bool:
+    """
+    Check if phone number is a valid DACH phone number.
+    Accepts:
+    - International format: +49, +43, +41, 0049, 0043, 0041
+    - National format: 0xxx (German domestic, e.g. 0176, 030, 089)
+
+    Filters out numbers that are too short or have no recognizable prefix.
+    """
+    if not number:
+        return False
+
+    # Clean the number - keep only digits and +
+    cleaned = re.sub(r'[^\d+]', '', number)
+
+    # Minimum length check (at least 8 digits for a real phone number)
+    digits_only = re.sub(r'\D', '', cleaned)
+    if len(digits_only) < 8:
+        return False
+
+    # Valid patterns:
+    # 1. International DACH: +49, +43, +41
+    if cleaned.startswith(('+49', '+43', '+41')):
+        return True
+
+    # 2. International with 00: 0049, 0043, 0041
+    if cleaned.startswith(('0049', '0043', '0041')):
+        return True
+
+    # 3. German national format: starts with 0 (e.g. 0176, 030, 089)
+    #    This covers mobile (015x, 016x, 017x) and landline (0xx)
+    if cleaned.startswith('0') and not cleaned.startswith('00'):
+        return True
+
+    # No valid prefix found
+    return False
+
+
 async def enrich_lead(
     payload: WebhookPayload,
     skip_paid_apis: bool = False
 ) -> EnrichmentResult:
     """
-    Main enrichment pipeline - OPTIMIZED FLOW v2.
+    Main enrichment pipeline - OPTIMIZED FLOW v3.
 
     Flow:
-    1. LLM Parse → Extract contact name, company, email from job posting
-    2. Decision Maker Discovery → If no contact found, search for executives
-       - Apollo Free Search (no credits!)
-       - Google Decision Maker Search (FREE!)
-    3. Google LinkedIn Search → Find LinkedIn URL (FREE with Google API)
-    4. FullEnrich → Try to get phone FIRST (10 credits/phone, but saves Kaspr)
-    5. Kaspr (fallback) → If no phone yet + have LinkedIn (1 credit)
-    6. Impressum Scraping → Free fallback for company phone
+    1.  LLM Parse → Extract contact name, company, email from job posting
+    1b. Google Domain Search → If no domain, find via Google (FREE!)
+    2.  Impressum Scraping (ALWAYS!) → Company phone, website, address (FREE!)
+    3.  Decision Maker Discovery → Find executives (FREE!)
+    4.  Google LinkedIn Search → Find personal LinkedIn URL (FREE!)
+    5.  FullEnrich → Get PERSONAL mobile phone (PAID: 10 credits)
+    6.  Kaspr → Fallback for mobile (PAID: 1 credit)
+    7.  Company Research → Industry, employee count, sales brief (FREE!)
+    8.  Company LinkedIn → Find company LinkedIn page (FREE!)
+
+    OUTPUT - company object contains:
+    - domain, industry, employee_count, location
+    - phone (company landline), website, linkedin_url
+
+    IMPORTANT:
+    - Impressum = COMPANY data (main phone, address, website)
+    - FullEnrich/Kaspr = PERSONAL data (decision maker's mobile)
+    - Both are needed!
 
     Args:
         payload: Job posting data
@@ -49,13 +102,58 @@ async def enrich_lead(
     company_info = CompanyInfo(
         name=parsed.company_name,
         domain=parsed.company_domain,
-        location=parsed.location
+        location=parsed.location or payload.location  # Use job location as fallback
     )
 
-    # Step 2: Build decision maker from parsed contact
+    # Step 1b: Google Domain Search - If no domain from LLM, find it (FREE!)
+    if not company_info.domain and parsed.company_name:
+        logger.info("No domain from LLM - searching via Google...")
+        found_domain = await _google_find_domain(parsed.company_name)
+        if found_domain:
+            company_info.domain = found_domain
+            enrichment_path.append("google_domain_found")
+            logger.info(f"Google found domain: {found_domain}")
+
+    # Step 2: Impressum Scraping - ALWAYS run for company data (FREE!)
+    # This gets us: company phone, website, address
+    logger.info("Scraping Impressum for company data (always, not just fallback)...")
+    impressum = ImpressumScraper()
+    impressum_result = await impressum.scrape(
+        company_name=parsed.company_name,
+        domain=parsed.company_domain
+    )
+
+    if impressum_result:
+        enrichment_path.append("impressum")
+
+        # Store COMPANY phone (not personal!) - no filtering for company phones
+        if impressum_result.phones:
+            company_info.phone = impressum_result.phones[0].number
+            enrichment_path.append("impressum_company_phone")
+            logger.info(f"Impressum found company phone: {company_info.phone}")
+
+        # Store website
+        if impressum_result.website_url:
+            company_info.website = impressum_result.website_url
+            enrichment_path.append("impressum_website")
+            logger.info(f"Impressum found website: {company_info.website}")
+
+        # Store address as location (if not already set)
+        if impressum_result.address and not company_info.location:
+            company_info.location = impressum_result.address
+            enrichment_path.append("impressum_address")
+            logger.info(f"Impressum found address: {company_info.location}")
+
+        logger.info(f"Impressum: {len(impressum_result.phones)} phones, {len(impressum_result.emails)} emails")
+
+    # Step 3: Build decision maker from parsed contact
     decision_maker: Optional[DecisionMaker] = None
     collected_emails: List[str] = []
     linkedin_url: Optional[str] = None
+
+    # Add Impressum emails to collection
+    if impressum_result and impressum_result.emails:
+        collected_emails.extend(impressum_result.emails)
 
     if parsed.contact_name:
         names = parsed.contact_name.split()
@@ -75,7 +173,7 @@ async def enrich_lead(
         enrichment_path.append("contact_from_posting")
         logger.info(f"Contact from posting: {parsed.contact_name}")
 
-    # Step 2b: Decision Maker Discovery - If NO contact in job posting, find one!
+    # Step 3b: Decision Maker Discovery - If NO contact in job posting, find one!
     # Priority: HR/Recruiting > Job-relevant dept head > General executive
     if not decision_maker and parsed.company_name:
         logger.info("No contact in job posting - searching for decision maker...")
@@ -106,7 +204,7 @@ async def enrich_lead(
             enrichment_path.append("google_dm_search")
             logger.info(f"Google found decision maker: {dm_result['name']} ({dm_result.get('title')})")
 
-    # Step 3: Google LinkedIn Search - Find LinkedIn profile (FREE!)
+    # Step 4: Google LinkedIn Search - Find LinkedIn profile (FREE!)
     # Only if we have a name but no LinkedIn URL yet
     if decision_maker and not linkedin_url:
         logger.info("Searching LinkedIn via Google...")
@@ -124,7 +222,7 @@ async def enrich_lead(
             enrichment_path.append("google_linkedin_found")
             logger.info(f"Google found LinkedIn: {linkedin_url}")
 
-    # Step 4: FullEnrich FIRST - Try to get phone before using Kaspr
+    # Step 5: FullEnrich - Try to get PERSONAL phone
     # FullEnrich: 10 credits/phone, but saves Kaspr credits
     phone_result: Optional[PhoneResult] = None
 
@@ -159,7 +257,7 @@ async def enrich_lead(
 
             logger.info(f"FullEnrich: {len(fe_result.emails)} emails, {len(fe_result.phones)} phones")
 
-    # Step 5: Kaspr - Try if no phone OR only landline found
+    # Step 6: Kaspr - Try if no PERSONAL phone OR only landline found
     # Kaspr: 1 credit per request, UNLIMITED emails
     # We want mobile numbers, so try Kaspr even if we have a landline
     need_kaspr = (
@@ -197,27 +295,6 @@ async def enrich_lead(
 
             logger.info(f"Kaspr: {len(kaspr_result.emails)} emails, {len(kaspr_result.phones)} phones")
 
-    # Step 6: Impressum Scraping - FREE fallback for company phone
-    if not phone_result:
-        logger.info("Trying Impressum scraping...")
-        impressum = ImpressumScraper()
-
-        imp_result = await impressum.scrape(
-            company_name=parsed.company_name,
-            domain=parsed.company_domain
-        )
-
-        if imp_result:
-            enrichment_path.append("impressum")
-            collected_emails.extend(imp_result.emails)
-
-            if imp_result.phones:
-                phone_result = _get_best_phone(imp_result.phones)
-                enrichment_path.append("impressum_phone_found")
-                logger.info(f"Impressum found phone: {phone_result.number}")
-
-            logger.info(f"Impressum: {len(imp_result.emails)} emails, {len(imp_result.phones)} phones")
-
     # Step 7: Company Research - FREE sales intelligence
     logger.info("Researching company for sales brief...")
     company_intel: Optional[CompanyIntel] = None
@@ -245,8 +322,28 @@ async def enrich_lead(
             )
             enrichment_path.append("company_research")
             logger.info(f"Company research complete: {len(intel_result.summary)} char summary")
+
+            # Transfer research data to company_info
+            if intel_result.industry and not company_info.industry:
+                company_info.industry = intel_result.industry
+            if intel_result.employee_count and not company_info.employee_count:
+                company_info.employee_count = intel_result.employee_count
+            if intel_result.headquarters and not company_info.location:
+                company_info.location = intel_result.headquarters
     except Exception as e:
         logger.warning(f"Company research failed: {e}")
+
+    # Step 8: Find Company LinkedIn URL (FREE!)
+    if not company_info.linkedin_url and parsed.company_name:
+        logger.info("Searching for company LinkedIn page...")
+        company_linkedin = await _google_find_company_linkedin(
+            parsed.company_name,
+            company_info.domain
+        )
+        if company_linkedin:
+            company_info.linkedin_url = company_linkedin
+            enrichment_path.append("company_linkedin_found")
+            logger.info(f"Found company LinkedIn: {company_linkedin}")
 
     # Deduplicate and clean emails
     unique_emails = list(set(e.lower().strip() for e in collected_emails if e and '@' in e))
@@ -260,7 +357,12 @@ async def enrich_lead(
             decision_maker.email = unique_emails[0]
 
     # Build result
-    success = phone_result is not None or len(unique_emails) > 0
+    # Success if we have: personal phone OR company phone OR emails
+    success = (
+        phone_result is not None or
+        company_info.phone is not None or
+        len(unique_emails) > 0
+    )
 
     result = EnrichmentResult(
         success=success,
@@ -291,6 +393,13 @@ def _get_best_phone(phones: List[PhoneResult]) -> Optional[PhoneResult]:
     if not phones:
         return None
 
+    # Filter out phones without valid DACH prefix
+    valid_phones = [p for p in phones if _is_valid_dach_phone(p.number)]
+
+    if not valid_phones:
+        logger.info("No phones with valid DACH prefix found - filtered out")
+        return None
+
     # Sort: mobile first, then by source priority
     source_priority = {
         PhoneSource.KASPR: 0,
@@ -304,4 +413,125 @@ def _get_best_phone(phones: List[PhoneResult]) -> Optional[PhoneResult]:
         source_score = source_priority.get(p.source, 99)
         return (type_score, source_score)
 
-    return min(phones, key=score)
+    return min(valid_phones, key=score)
+
+
+async def _google_find_domain(company_name: str) -> Optional[str]:
+    """
+    Find company domain via Google Custom Search (FREE!).
+    Searches for company website and extracts domain.
+    """
+    settings = get_settings()
+
+    if not settings.google_api_key or not settings.google_cse_id:
+        logger.warning("Google API keys not configured - skipping domain search")
+        return None
+
+    async with httpx.AsyncClient(timeout=settings.api_timeout) as client:
+        # Search for company website
+        query = f'"{company_name}" official website'
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "key": settings.google_api_key,
+            "cx": settings.google_cse_id,
+            "q": query,
+            "num": 5
+        }
+
+        try:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            items = data.get("items", [])
+
+            # Skip common non-company domains
+            skip_domains = {
+                'linkedin.com', 'xing.com', 'facebook.com', 'twitter.com',
+                'instagram.com', 'youtube.com', 'wikipedia.org', 'kununu.de',
+                'glassdoor.com', 'indeed.com', 'stepstone.de', 'monster.de',
+                'arbeitsagentur.de', 'meinestadt.de', 'gelbeseiten.de'
+            }
+
+            company_lower = company_name.lower().replace(" ", "").replace("-", "")
+
+            for item in items:
+                link = item.get("link", "")
+                if not link:
+                    continue
+
+                parsed = urlparse(link)
+                domain = parsed.netloc.replace("www.", "")
+
+                # Skip social media and job portals
+                if any(skip in domain for skip in skip_domains):
+                    continue
+
+                # Prefer domains that contain company name (without spaces)
+                domain_clean = domain.lower().replace("-", "").replace(".", "")
+                if company_lower[:4] in domain_clean:
+                    logger.info(f"Found matching domain: {domain}")
+                    return domain
+
+            # If no matching domain, return first non-skipped result
+            for item in items:
+                link = item.get("link", "")
+                if link:
+                    parsed = urlparse(link)
+                    domain = parsed.netloc.replace("www.", "")
+                    if not any(skip in domain for skip in skip_domains):
+                        return domain
+
+        except Exception as e:
+            logger.warning(f"Google domain search failed: {e}")
+
+    return None
+
+
+async def _google_find_company_linkedin(
+    company_name: str,
+    domain: Optional[str] = None
+) -> Optional[str]:
+    """
+    Find company LinkedIn page via Google Custom Search (FREE!).
+    Returns LinkedIn company URL.
+    """
+    settings = get_settings()
+
+    if not settings.google_api_key or not settings.google_cse_id:
+        return None
+
+    async with httpx.AsyncClient(timeout=settings.api_timeout) as client:
+        # Search for company LinkedIn page
+        query = f'"{company_name}" site:linkedin.com/company'
+
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "key": settings.google_api_key,
+            "cx": settings.google_cse_id,
+            "q": query,
+            "num": 3
+        }
+
+        try:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            items = data.get("items", [])
+
+            for item in items:
+                link = item.get("link", "")
+                # Must be a LinkedIn company page
+                if "linkedin.com/company/" in link:
+                    # Clean up URL
+                    linkedin_url = link.split("?")[0]  # Remove query params
+                    # Normalize to https
+                    if linkedin_url.startswith("http://"):
+                        linkedin_url = linkedin_url.replace("http://", "https://")
+                    return linkedin_url
+
+        except Exception as e:
+            logger.warning(f"Google company LinkedIn search failed: {e}")
+
+    return None

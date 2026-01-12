@@ -16,7 +16,9 @@ class ImpressumResult:
     """Result from Impressum scraping."""
     phones: List[PhoneResult]
     emails: List[str]
-    success: bool
+    website_url: Optional[str] = None  # The actual URL we found
+    address: Optional[str] = None  # Street address if found
+    success: bool = False
 
 
 class ImpressumScraper:
@@ -134,13 +136,19 @@ class ImpressumScraper:
 
                 phones = self._extract_phones(text)
                 emails = self._extract_emails(text)
+                address = self._extract_address(text)
 
-                logger.info(f"Impressum {url}: {len(phones)} phones, {len(emails)} emails")
+                # Extract base website URL from the scraped page
+                website_url = self._get_base_url(str(response.url))
+
+                logger.info(f"Impressum {url}: {len(phones)} phones, {len(emails)} emails, address={address is not None}")
 
                 return ImpressumResult(
                     phones=phones,
                     emails=emails,
-                    success=len(phones) > 0
+                    website_url=website_url,
+                    address=address,
+                    success=len(phones) > 0 or len(emails) > 0 or address is not None
                 )
 
             except httpx.HTTPStatusError as e:
@@ -241,3 +249,33 @@ class ImpressumScraper:
             return PhoneType.LANDLINE
 
         return PhoneType.UNKNOWN
+
+    def _extract_address(self, text: str) -> Optional[str]:
+        """Extract street address from Impressum text."""
+        # German address patterns: Street + Number, PLZ + City
+        # e.g. "Musterstraße 123, 12345 Berlin"
+        patterns = [
+            # Full address: Street Number, PLZ City
+            r'([A-ZÄÖÜ][a-zäöüß]+(?:straße|str\.|weg|platz|allee|ring|gasse|damm)\s+\d+[a-z]?\s*,?\s*\d{5}\s+[A-ZÄÖÜ][a-zäöüß\-]+)',
+            # Street + Number only
+            r'([A-ZÄÖÜ][a-zäöüß]+(?:straße|str\.|weg|platz|allee|ring|gasse|damm)\s+\d+[a-z]?)',
+            # PLZ + City pattern
+            r'(\d{5}\s+[A-ZÄÖÜ][a-zäöüß\-]+(?:\s+[A-ZÄÖÜ][a-zäöüß\-]+)?)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                address = match.group(1).strip()
+                # Validate: should have numbers and letters
+                if re.search(r'\d', address) and re.search(r'[a-zA-Z]', address):
+                    return address
+
+        return None
+
+    def _get_base_url(self, url: str) -> str:
+        """Extract base website URL from a full URL."""
+        # https://www.example.com/impressum -> https://www.example.com
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}"
