@@ -8,7 +8,7 @@ import httpx
 from config import get_settings
 from models import (
     WebhookPayload, EnrichmentResult, CompanyInfo, CompanyIntel,
-    DecisionMaker, PhoneResult, PhoneSource, PhoneType
+    DecisionMaker, PhoneResult, PhoneSource, PhoneType, PhoneStatus
 )
 from llm_parser import parse_job_posting
 from clients.kaspr import KasprClient
@@ -16,6 +16,7 @@ from clients.fullenrich import FullEnrichClient
 from clients.impressum import ImpressumScraper
 from clients.linkedin_search import LinkedInSearchClient
 from clients.company_research import CompanyResearcher
+from utils.stats import track_phone_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -251,9 +252,36 @@ async def enrich_lead(
 
             # Check if FullEnrich found phones
             if fe_result.phones:
-                phone_result = _get_best_phone(fe_result.phones)
-                enrichment_path.append("fullenrich_phone_found")
-                logger.info(f"FullEnrich found phone: {phone_result.number}")
+                fe_phone = _get_best_phone(fe_result.phones)
+                if fe_phone:
+                    phone_result = fe_phone
+                    enrichment_path.append("fullenrich_phone_found")
+                    logger.info(f"FullEnrich found phone: {phone_result.number}")
+                    # Track statistics
+                    track_phone_attempt(
+                        service="fullenrich",
+                        phones_returned=fe_result.phones,
+                        dach_valid_phone=fe_phone,
+                        phone_type=fe_phone.type.value
+                    )
+                else:
+                    logger.info(f"FullEnrich returned {len(fe_result.phones)} phones but none with valid DACH prefix")
+                    enrichment_path.append("fullenrich_filtered_non_dach")
+                    # Track filtered out phones
+                    track_phone_attempt(
+                        service="fullenrich",
+                        phones_returned=fe_result.phones,
+                        dach_valid_phone=None,
+                        phone_type=None
+                    )
+            else:
+                # Track no phone returned
+                track_phone_attempt(
+                    service="fullenrich",
+                    phones_returned=[],
+                    dach_valid_phone=None,
+                    phone_type=None
+                )
 
             logger.info(f"FullEnrich: {len(fe_result.emails)} emails, {len(fe_result.phones)} phones")
 
@@ -292,6 +320,31 @@ async def enrich_lead(
                         phone_result = kaspr_phone
                         enrichment_path.append("kaspr_mobile_upgrade")
                     logger.info(f"Kaspr found phone: {kaspr_phone.number} ({kaspr_phone.type.value})")
+                    # Track statistics
+                    track_phone_attempt(
+                        service="kaspr",
+                        phones_returned=kaspr_result.phones,
+                        dach_valid_phone=kaspr_phone,
+                        phone_type=kaspr_phone.type.value
+                    )
+                else:
+                    logger.info(f"Kaspr returned {len(kaspr_result.phones)} phones but none with valid DACH prefix")
+                    enrichment_path.append("kaspr_filtered_non_dach")
+                    # Track filtered out phones
+                    track_phone_attempt(
+                        service="kaspr",
+                        phones_returned=kaspr_result.phones,
+                        dach_valid_phone=None,
+                        phone_type=None
+                    )
+            else:
+                # Track no phone returned
+                track_phone_attempt(
+                    service="kaspr",
+                    phones_returned=[],
+                    dach_valid_phone=None,
+                    phone_type=None
+                )
 
             logger.info(f"Kaspr: {len(kaspr_result.emails)} emails, {len(kaspr_result.phones)} phones")
 
@@ -364,12 +417,30 @@ async def enrich_lead(
         len(unique_emails) > 0
     )
 
+    # Determine phone status for clear feedback
+    if phone_result:
+        if phone_result.type == PhoneType.MOBILE:
+            phone_status = PhoneStatus.FOUND_MOBILE
+        else:
+            phone_status = PhoneStatus.FOUND_LANDLINE
+    elif skip_paid_apis:
+        phone_status = PhoneStatus.SKIPPED_PAID_API
+    elif not decision_maker:
+        phone_status = PhoneStatus.NO_DECISION_MAKER
+    elif not linkedin_url:
+        phone_status = PhoneStatus.NO_LINKEDIN
+    elif "filtered_non_dach" in enrichment_path or any("filtered" in p for p in enrichment_path):
+        phone_status = PhoneStatus.FILTERED_NON_DACH
+    else:
+        phone_status = PhoneStatus.API_NO_RESULT
+
     result = EnrichmentResult(
         success=success,
         company=company_info,
         company_intel=company_intel,
         decision_maker=decision_maker,
         phone=phone_result,
+        phone_status=phone_status,
         emails=unique_emails,
         enrichment_path=enrichment_path,
         job_id=payload.id,

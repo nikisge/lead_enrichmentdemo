@@ -86,6 +86,17 @@ class CompanyIntel(BaseModel):
     website_url: str = ""
 
 
+# Phone Status - explains why we do/don't have a phone
+class PhoneStatus(str, Enum):
+    FOUND_MOBILE = "found_mobile"           # Best case: mobile number found
+    FOUND_LANDLINE = "found_landline"       # Landline found (less ideal)
+    FILTERED_NON_DACH = "filtered_non_dach" # APIs returned phones but all non-German
+    NO_LINKEDIN = "no_linkedin"             # Couldn't find LinkedIn profile
+    NO_DECISION_MAKER = "no_decision_maker" # Couldn't identify a contact person
+    API_NO_RESULT = "api_no_result"         # APIs returned nothing
+    SKIPPED_PAID_API = "skipped_paid_api"   # Test mode - paid APIs skipped
+
+
 # Final Enrichment Result
 class EnrichmentResult(BaseModel):
     success: bool
@@ -93,6 +104,7 @@ class EnrichmentResult(BaseModel):
     company_intel: Optional[CompanyIntel] = None  # Sales research data
     decision_maker: Optional[DecisionMaker] = None
     phone: Optional[PhoneResult] = None
+    phone_status: PhoneStatus = PhoneStatus.API_NO_RESULT  # Why we do/don't have a phone
     emails: List[str] = Field(default_factory=list)
     enrichment_path: List[str] = Field(default_factory=list)
     error: Optional[str] = None

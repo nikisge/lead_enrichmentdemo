@@ -1,10 +1,11 @@
 import logging
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from config import get_settings
 from models import WebhookPayload, EnrichmentResult
 from pipeline import enrich_lead, enrich_lead_test_mode
+from utils.stats import get_stats, get_stats_summary, reset_stats
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +23,32 @@ app = FastAPI(
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/stats")
+async def get_enrichment_stats():
+    """
+    Get enrichment service statistics.
+    Shows success rates for Kaspr, FullEnrich, and country distribution.
+    """
+    return get_stats()
+
+
+@app.get("/stats/summary")
+async def get_enrichment_stats_summary():
+    """
+    Get human-readable stats summary.
+    """
+    return PlainTextResponse(content=get_stats_summary())
+
+
+@app.post("/stats/reset")
+async def reset_enrichment_stats():
+    """
+    Reset all statistics.
+    """
+    reset_stats()
+    return {"status": "reset", "message": "Statistics have been reset"}
 
 
 @app.post("/webhook/enrich")
