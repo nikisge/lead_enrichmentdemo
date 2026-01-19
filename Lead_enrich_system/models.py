@@ -50,6 +50,8 @@ class DecisionMaker(BaseModel):
     linkedin_url: Optional[str] = None
     email: Optional[str] = None
     apollo_id: Optional[str] = None
+    verified_current: bool = True  # False if we're not sure they still work there
+    verification_note: Optional[str] = None  # e.g. "(nicht verifiziert - könnte nicht mehr dort arbeiten)"
 
 
 # Phone Result
@@ -57,7 +59,6 @@ class PhoneResult(BaseModel):
     number: str
     type: PhoneType = PhoneType.UNKNOWN
     source: PhoneSource
-    formatted: Optional[str] = None
 
 
 # Company Info

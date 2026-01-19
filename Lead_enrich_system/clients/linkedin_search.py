@@ -1,7 +1,7 @@
 import logging
 import re
 import httpx
-from typing import Optional
+from typing import Optional, List
 
 from config import get_settings
 
@@ -186,7 +186,28 @@ class LinkedInSearchClient:
     ) -> Optional[dict]:
         """
         Search for a decision maker at a company when no contact name is known.
-        Uses Google to find LinkedIn profiles - OPTIMIZED: max 3 requests.
+        Returns the BEST single candidate (verified if possible).
+
+        For multiple candidates, use find_multiple_decision_makers() instead.
+        """
+        candidates = await self.find_multiple_decision_makers(
+            company=company,
+            domain=domain,
+            job_category=job_category,
+            max_candidates=1
+        )
+        return candidates[0] if candidates else None
+
+    async def find_multiple_decision_makers(
+        self,
+        company: str,
+        domain: Optional[str] = None,
+        job_category: Optional[str] = None,
+        max_candidates: int = 3
+    ) -> List[dict]:
+        """
+        Search for MULTIPLE decision makers at a company.
+        Returns up to max_candidates, prioritizing verified current employees.
 
         Priority:
         1. HR / Recruiting / Personal (best for job postings)
@@ -196,39 +217,53 @@ class LinkedInSearchClient:
         Args:
             company: Company name
             domain: Company domain (optional)
-            titles: List of titles to search for (optional)
             job_category: Job category like "IT", "Sales", etc.
+            max_candidates: Maximum number of candidates to return (default 3)
 
         Returns:
-            dict with 'name', 'title', 'linkedin_url' or None
+            List of dicts with 'name', 'title', 'linkedin_url', 'verified_current'
         """
         if not self.api_key or not self.cse_id:
             logger.warning("Google API key or CSE ID not configured for decision maker search")
-            return None
+            return []
 
-        # OPTIMIZED: Use combined searches (max 3 Google requests!)
+        all_candidates = []
+        seen_urls = set()
+
         # Search 1: HR/Recruiting (combined query)
         hr_query = "Personalleiter OR HR OR Recruiting OR Personal"
-        result = await self._search_decision_maker_combined(company, hr_query, domain)
-        if result:
-            return result
+        candidates = await self._search_decision_maker_combined(company, hr_query, domain, return_all=True)
+        for c in candidates:
+            if c["linkedin_url"] not in seen_urls:
+                seen_urls.add(c["linkedin_url"])
+                all_candidates.append(c)
 
         # Search 2: Job-category specific (if category provided)
         if job_category:
             category_query = self._get_category_query(job_category)
             if category_query:
-                result = await self._search_decision_maker_combined(company, category_query, domain)
-                if result:
-                    return result
+                candidates = await self._search_decision_maker_combined(company, category_query, domain, return_all=True)
+                for c in candidates:
+                    if c["linkedin_url"] not in seen_urls:
+                        seen_urls.add(c["linkedin_url"])
+                        all_candidates.append(c)
 
         # Search 3: Executive fallback
         exec_query = "Geschäftsführer OR CEO OR Inhaber OR Managing Director"
-        result = await self._search_decision_maker_combined(company, exec_query, domain)
-        if result:
-            return result
+        candidates = await self._search_decision_maker_combined(company, exec_query, domain, return_all=True)
+        for c in candidates:
+            if c["linkedin_url"] not in seen_urls:
+                seen_urls.add(c["linkedin_url"])
+                all_candidates.append(c)
 
-        logger.info(f"No decision maker found for {company} after 3 searches")
-        return None
+        # Sort: verified first, then by score
+        all_candidates.sort(key=lambda x: (not x.get("verified_current", False), -x.get("score", 0)))
+
+        # Return top candidates
+        result = all_candidates[:max_candidates]
+        logger.info(f"Found {len(result)} decision maker candidates for {company} (verified: {sum(1 for c in result if c.get('verified_current'))})")
+
+        return result
 
     def _get_category_query(self, category: str) -> Optional[str]:
         """Get combined search query for job category."""
@@ -263,9 +298,18 @@ class LinkedInSearchClient:
         self,
         company: str,
         title_query: str,
-        domain: Optional[str] = None
-    ) -> Optional[dict]:
-        """Search Google with combined title query (OR syntax)."""
+        domain: Optional[str] = None,
+        return_all: bool = False
+    ) -> List[dict]:
+        """
+        Search Google with combined title query (OR syntax).
+
+        Args:
+            return_all: If True, return all matching candidates. If False, return only best one.
+
+        Returns:
+            List of candidate dicts (empty list if none found)
+        """
         # Build search query with OR combinations
         query = f'({title_query}) "{company}" site:linkedin.com/in'
 
@@ -288,9 +332,11 @@ class LinkedInSearchClient:
 
                 items = data.get("items", [])
                 if not items:
-                    return None
+                    return []
 
-                # Find best match from results
+                # Find matches from results - prioritize verified current employees
+                candidates = []
+
                 for item in items:
                     link = item.get("link", "")
                     item_title = item.get("title", "")
@@ -304,10 +350,8 @@ class LinkedInSearchClient:
                     company_lower = company.lower()
                     company_words = [w for w in company_lower.split() if len(w) > 2]
 
-                    company_match = any(
-                        word in item_title.lower() or word in snippet.lower()
-                        for word in company_words
-                    )
+                    combined_text = (item_title + " " + snippet).lower()
+                    company_match = any(word in combined_text for word in company_words)
 
                     if not company_match:
                         continue
@@ -320,21 +364,97 @@ class LinkedInSearchClient:
                     linkedin_url = self._normalize_linkedin_url(link)
                     extracted_title = self._extract_title_from_snippet(snippet, "")
 
-                    logger.info(f"Found: {name} ({extracted_title}) at {company}")
-                    return {
+                    # Check if person is CURRENTLY at this company
+                    is_current = self._is_currently_at_company(snippet, item_title, company)
+
+                    candidates.append({
                         "name": name,
                         "title": extracted_title,
-                        "linkedin_url": linkedin_url
-                    }
+                        "linkedin_url": linkedin_url,
+                        "verified_current": is_current,
+                        "score": 10 if is_current else 1  # Prioritize current employees
+                    })
 
-                return None
+                if not candidates:
+                    return []
+
+                # Sort by score (verified current employees first)
+                candidates.sort(key=lambda x: x["score"], reverse=True)
+
+                if return_all:
+                    return candidates
+
+                # Return only best one
+                best = candidates[0]
+                if best["verified_current"]:
+                    logger.info(f"Found VERIFIED: {best['name']} ({best['title']}) aktuell bei {company}")
+                else:
+                    logger.info(f"Found UNVERIFIED: {best['name']} ({best['title']}) - könnte nicht mehr bei {company} sein")
+
+                return [best]
 
             except httpx.HTTPStatusError as e:
                 logger.error(f"Google API error: {e.response.status_code}")
-                return None
+                return []
             except Exception as e:
                 logger.error(f"Decision maker search failed: {e}")
-                return None
+                return []
+
+    def _is_currently_at_company(self, snippet: str, title: str, company: str) -> bool:
+        """
+        Check if LinkedIn snippet/title indicates person is CURRENTLY at the company.
+        Returns True if there's strong evidence they currently work there.
+        """
+        text = (snippet + " " + title).lower()
+        company_lower = company.lower()
+
+        # Strong indicators of current employment
+        current_indicators = [
+            # German
+            f"aktuell bei {company_lower}",
+            f"aktuell: {company_lower}",
+            f"derzeit bei {company_lower}",
+            f"derzeit: {company_lower}",
+            f"tätig bei {company_lower}",
+            # English
+            f"currently at {company_lower}",
+            f"current: {company_lower}",
+            f"working at {company_lower}",
+            # LinkedIn patterns - title usually shows current position
+            f"bei {company_lower}",
+            f"at {company_lower}",
+        ]
+
+        # Check for current indicators with company name
+        for indicator in current_indicators:
+            if indicator in text:
+                return True
+
+        # Check if company appears right after title patterns (LinkedIn format)
+        # e.g. "Max Müller - HR Manager bei Firma XYZ"
+        company_words = [w for w in company_lower.split() if len(w) > 2]
+        for word in company_words:
+            # Pattern: "titel bei/at firma" suggests current role
+            if re.search(rf'(manager|leiter|director|head|ceo|cto|cfo)\s+(bei|at|@)\s+\w*{word}', text):
+                return True
+
+        # Check for negative indicators (former employment)
+        former_indicators = [
+            "ehemalig", "ehemals", "former", "previously", "ex-",
+            "bis 20", "until 20", "left in", "verließ"
+        ]
+
+        for indicator in former_indicators:
+            if indicator in text:
+                return False
+
+        # If company is in the text near the beginning (typical for current job), consider it likely current
+        # LinkedIn snippets usually start with current position
+        first_100_chars = text[:100]
+        if any(word in first_100_chars for word in company_words):
+            return True
+
+        return False
 
     def _get_category_titles(self, category: str) -> list:
         """Get relevant department head titles based on job category."""

@@ -180,6 +180,7 @@ class FullEnrichClient:
                     # Add country code if region is DE and number doesn't have it
                     if region == "DE" and not number.startswith("+"):
                         number = "+49" + number.lstrip("0")
+
                     phones.append(PhoneResult(
                         number=number,
                         type=PhoneType.MOBILE if is_mobile else PhoneType.UNKNOWN,

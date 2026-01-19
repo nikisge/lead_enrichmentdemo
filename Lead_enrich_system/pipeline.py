@@ -13,7 +13,7 @@ from models import (
 from llm_parser import parse_job_posting
 from clients.kaspr import KasprClient
 from clients.fullenrich import FullEnrichClient
-from clients.impressum import ImpressumScraper
+from clients.impressum import ImpressumScraper, TeamMember
 from clients.linkedin_search import LinkedInSearchClient
 from clients.company_research import CompanyResearcher
 from utils.stats import track_phone_attempt
@@ -156,197 +156,185 @@ async def enrich_lead(
     if impressum_result and impressum_result.emails:
         collected_emails.extend(impressum_result.emails)
 
+    # Step 3: Build candidate list for phone enrichment
+    # Priority: 1. Contact from job posting 2. Team page 3. LinkedIn search
+    # Max 3 candidates total, stop when phone found
+    phone_result: Optional[PhoneResult] = None
+    dm_candidates = []
+
+    # Step 3a: Contact from job posting = FIRST candidate (highest priority!)
     if parsed.contact_name:
         names = parsed.contact_name.split()
         first_name = names[0] if names else ""
         last_name = " ".join(names[1:]) if len(names) > 1 else ""
 
-        decision_maker = DecisionMaker(
-            name=parsed.contact_name,
-            first_name=first_name,
-            last_name=last_name,
-            email=parsed.contact_email
-        )
+        dm_candidates.append({
+            "name": parsed.contact_name,
+            "title": None,
+            "linkedin_url": None,
+            "verified_current": True,  # From job posting = definitely current
+            "source": "job_posting",
+            "email": parsed.contact_email
+        })
 
         if parsed.contact_email:
             collected_emails.append(parsed.contact_email)
 
         enrichment_path.append("contact_from_posting")
-        logger.info(f"Contact from posting: {parsed.contact_name}")
+        logger.info(f"Contact from posting: {parsed.contact_name} (will try first)")
 
-    # Step 3b: Decision Maker Discovery - If NO contact in job posting, find one!
-    # Priority: HR/Recruiting > Job-relevant dept head > General executive
-    if not decision_maker and parsed.company_name:
-        logger.info("No contact in job posting - searching for decision maker...")
+    # Step 3b: If we need more candidates (< 3), search for more
+    if len(dm_candidates) < 3 and parsed.company_name:
+        remaining_slots = 3 - len(dm_candidates)
+        logger.info(f"Searching for {remaining_slots} more candidates (have {len(dm_candidates)} from posting)...")
         logger.info(f"Job category: {payload.category}")
 
-        # Google Decision Maker Search (FREE!) - with job category for smart prioritization
-        linkedin_client = LinkedInSearchClient()
-
-        dm_result = await linkedin_client.find_decision_maker(
-            company=parsed.company_name,
-            domain=parsed.company_domain,
-            job_category=payload.category  # Pass category for relevant dept head search
+        # STEP 3b-1: Try Team Page FIRST (verified contacts!)
+        logger.info("Step 3b-1: Checking company team page for verified contacts...")
+        impressum_scraper = ImpressumScraper()
+        team_result = await impressum_scraper.scrape_team_page(
+            company_name=parsed.company_name,
+            domain=company_info.domain,
+            job_category=payload.category
         )
 
-        if dm_result:
+        if team_result and team_result.members:
+            logger.info(f"Found {len(team_result.members)} team members on company website (VERIFIED)")
+            enrichment_path.append(f"team_page_{len(team_result.members)}_members")
+
+            # Convert TeamMembers to candidate format (these are VERIFIED!)
+            # Only add as many as we have remaining slots
+            for member in team_result.members[:remaining_slots]:
+                # Don't add if already have this person from job posting
+                if not any(c["name"].lower() == member.name.lower() for c in dm_candidates):
+                    dm_candidates.append({
+                        "name": member.name,
+                        "title": member.title,
+                        "linkedin_url": None,  # Will search LinkedIn next
+                        "verified_current": True,  # Team page = definitely current employee
+                        "source": "team_page"
+                    })
+
+        # STEP 3b-2: If not enough from team page, supplement with LinkedIn search
+        if len(dm_candidates) < 3:
+            remaining = 3 - len(dm_candidates)
+            logger.info(f"Step 3b-2: Searching LinkedIn for {remaining} more candidates...")
+
+            linkedin_client = LinkedInSearchClient()
+            linkedin_candidates = await linkedin_client.find_multiple_decision_makers(
+                company=parsed.company_name,
+                domain=parsed.company_domain,
+                job_category=payload.category,
+                max_candidates=remaining
+            )
+
+            # Add LinkedIn candidates (mark source)
+            for lc in linkedin_candidates:
+                # Don't add if we already have this person from team page
+                if not any(c["name"].lower() == lc["name"].lower() for c in dm_candidates):
+                    lc["source"] = "linkedin"
+                    dm_candidates.append(lc)
+
+        # Ensure max 3 candidates total
+        dm_candidates = dm_candidates[:3]
+
+    # Log total candidates
+    enrichment_path.append(f"total_{len(dm_candidates)}_candidates")
+    logger.info(f"Total candidates to try: {len(dm_candidates)}")
+
+    # Step 4: Try each candidate until we find a phone (max 3!)
+    if dm_candidates:
+        for idx, dm_result in enumerate(dm_candidates):
+            candidate_num = idx + 1
+            source = dm_result.get("source", "unknown")
+            logger.info(f"=== Trying candidate {candidate_num}/{len(dm_candidates)}: {dm_result['name']} (from {source}) ===")
+
             names = dm_result["name"].split()
             first_name = names[0] if names else ""
             last_name = " ".join(names[1:]) if len(names) > 1 else ""
+
+            is_verified = dm_result.get("verified_current", False)
+            verification_note = None if is_verified else "(nicht verifiziert - könnte nicht mehr dort arbeiten)"
+
+            current_dm = DecisionMaker(
+                name=dm_result["name"],
+                first_name=first_name,
+                last_name=last_name,
+                title=dm_result.get("title"),
+                linkedin_url=dm_result.get("linkedin_url"),
+                verified_current=is_verified,
+                verification_note=verification_note
+            )
+
+            # Add email from job posting if available
+            if dm_result.get("email"):
+                current_dm.email = dm_result["email"]
+
+            current_linkedin_url = dm_result.get("linkedin_url")
+
+            status = "VERIFIED" if is_verified else "UNVERIFIED"
+            logger.info(f"Candidate {candidate_num} ({status}): {dm_result['name']} ({dm_result.get('title')})")
+
+            # For candidates without LinkedIn URL: Search LinkedIn first
+            if not current_linkedin_url and source in ["team_page", "job_posting"]:
+                logger.info(f"Searching LinkedIn for: {dm_result['name']}")
+                linkedin_client = LinkedInSearchClient()
+                found_url = await linkedin_client.find_linkedin_profile(
+                    name=dm_result["name"],
+                    company=parsed.company_name,
+                    domain=parsed.company_domain
+                )
+                if found_url:
+                    current_linkedin_url = found_url
+                    current_dm.linkedin_url = found_url
+                    enrichment_path.append(f"linkedin_found_candidate_{candidate_num}")
+                    logger.info(f"Found LinkedIn: {found_url}")
+
+            # Try to get phone for this candidate
+            candidate_phone, candidate_emails = await _try_enrich_candidate(
+                candidate=current_dm,
+                linkedin_url=current_linkedin_url,
+                company_name=parsed.company_name,
+                domain=parsed.company_domain,
+                skip_paid_apis=skip_paid_apis,
+                enrichment_path=enrichment_path
+            )
+
+            collected_emails.extend(candidate_emails)
+
+            if candidate_phone:
+                # Found a phone! Use this candidate
+                phone_result = candidate_phone
+                decision_maker = current_dm
+                linkedin_url = current_linkedin_url
+                enrichment_path.append(f"phone_found_candidate_{candidate_num}")
+                logger.info(f"SUCCESS: Found phone for candidate {candidate_num}: {candidate_phone.number}")
+                break
+            else:
+                logger.info(f"No phone found for candidate {candidate_num}, trying next...")
+
+        # If no phone found with any candidate, use the first (best) one
+        if not decision_maker and dm_candidates:
+            dm_result = dm_candidates[0]
+            names = dm_result["name"].split()
+            first_name = names[0] if names else ""
+            last_name = " ".join(names[1:]) if len(names) > 1 else ""
+            is_verified = dm_result.get("verified_current", False)
 
             decision_maker = DecisionMaker(
                 name=dm_result["name"],
                 first_name=first_name,
                 last_name=last_name,
                 title=dm_result.get("title"),
-                linkedin_url=dm_result.get("linkedin_url")
+                linkedin_url=dm_result.get("linkedin_url"),
+                verified_current=is_verified,
+                verification_note=None if is_verified else "(nicht verifiziert)"
             )
+            if dm_result.get("email"):
+                decision_maker.email = dm_result["email"]
             linkedin_url = dm_result.get("linkedin_url")
-            enrichment_path.append("google_dm_search")
-            logger.info(f"Google found decision maker: {dm_result['name']} ({dm_result.get('title')})")
-
-    # Step 4: Google LinkedIn Search - Find LinkedIn profile (FREE!)
-    # Only if we have a name but no LinkedIn URL yet
-    if decision_maker and not linkedin_url:
-        logger.info("Searching LinkedIn via Google...")
-        linkedin_client = LinkedInSearchClient()
-
-        found_url = await linkedin_client.find_linkedin_profile(
-            name=decision_maker.name,
-            company=parsed.company_name,
-            domain=parsed.company_domain
-        )
-
-        if found_url:
-            linkedin_url = found_url
-            decision_maker.linkedin_url = linkedin_url
-            enrichment_path.append("google_linkedin_found")
-            logger.info(f"Google found LinkedIn: {linkedin_url}")
-
-    # Step 5: FullEnrich - Try to get PERSONAL phone
-    # FullEnrich: 10 credits/phone, but saves Kaspr credits
-    phone_result: Optional[PhoneResult] = None
-
-    if not skip_paid_apis and decision_maker and decision_maker.first_name and decision_maker.last_name:
-        logger.info("Trying FullEnrich FIRST (saves Kaspr credits)...")
-        fullenrich = FullEnrichClient()
-
-        fe_result = await fullenrich.enrich(
-            first_name=decision_maker.first_name,
-            last_name=decision_maker.last_name,
-            company_name=parsed.company_name,
-            domain=parsed.company_domain,
-            linkedin_url=linkedin_url
-        )
-
-        if fe_result:
-            enrichment_path.append("fullenrich")
-            collected_emails.extend(fe_result.emails)
-
-            # Check if FullEnrich found LinkedIn (if we didn't have it)
-            if not linkedin_url and fe_result.linkedin_url:
-                linkedin_url = fe_result.linkedin_url
-                decision_maker.linkedin_url = linkedin_url
-                enrichment_path.append("fullenrich_linkedin_found")
-                logger.info(f"FullEnrich found LinkedIn: {linkedin_url}")
-
-            # Check if FullEnrich found phones
-            if fe_result.phones:
-                fe_phone = _get_best_phone(fe_result.phones)
-                if fe_phone:
-                    phone_result = fe_phone
-                    enrichment_path.append("fullenrich_phone_found")
-                    logger.info(f"FullEnrich found phone: {phone_result.number}")
-                    # Track statistics
-                    track_phone_attempt(
-                        service="fullenrich",
-                        phones_returned=fe_result.phones,
-                        dach_valid_phone=fe_phone,
-                        phone_type=fe_phone.type.value
-                    )
-                else:
-                    logger.info(f"FullEnrich returned {len(fe_result.phones)} phones but none with valid DACH prefix")
-                    enrichment_path.append("fullenrich_filtered_non_dach")
-                    # Track filtered out phones
-                    track_phone_attempt(
-                        service="fullenrich",
-                        phones_returned=fe_result.phones,
-                        dach_valid_phone=None,
-                        phone_type=None
-                    )
-            else:
-                # Track no phone returned
-                track_phone_attempt(
-                    service="fullenrich",
-                    phones_returned=[],
-                    dach_valid_phone=None,
-                    phone_type=None
-                )
-
-            logger.info(f"FullEnrich: {len(fe_result.emails)} emails, {len(fe_result.phones)} phones")
-
-    # Step 6: Kaspr - Try if no PERSONAL phone OR only landline found
-    # Kaspr: 1 credit per request, UNLIMITED emails
-    # We want mobile numbers, so try Kaspr even if we have a landline
-    need_kaspr = (
-        not phone_result or
-        (phone_result and phone_result.type == PhoneType.LANDLINE)
-    )
-
-    if not skip_paid_apis and need_kaspr and linkedin_url:
-        reason = "no phone yet" if not phone_result else "only landline found, trying for mobile"
-        logger.info(f"Trying Kaspr ({reason}) with LinkedIn: {linkedin_url}")
-        kaspr = KasprClient()
-
-        kaspr_result = await kaspr.enrich_by_linkedin(
-            linkedin_url=linkedin_url,
-            name=decision_maker.name if decision_maker else ""
-        )
-
-        if kaspr_result:
-            enrichment_path.append("kaspr")
-            # Kaspr emails are unlimited - always collect
-            collected_emails.extend(kaspr_result.emails)
-
-            if kaspr_result.phones:
-                kaspr_phone = _get_best_phone(kaspr_result.phones)
-                # If Kaspr found mobile and we only had landline, prefer mobile
-                if kaspr_phone:
-                    if not phone_result:
-                        phone_result = kaspr_phone
-                        enrichment_path.append("kaspr_phone_found")
-                    elif kaspr_phone.type == PhoneType.MOBILE and phone_result.type != PhoneType.MOBILE:
-                        logger.info(f"Kaspr found mobile, replacing landline")
-                        phone_result = kaspr_phone
-                        enrichment_path.append("kaspr_mobile_upgrade")
-                    logger.info(f"Kaspr found phone: {kaspr_phone.number} ({kaspr_phone.type.value})")
-                    # Track statistics
-                    track_phone_attempt(
-                        service="kaspr",
-                        phones_returned=kaspr_result.phones,
-                        dach_valid_phone=kaspr_phone,
-                        phone_type=kaspr_phone.type.value
-                    )
-                else:
-                    logger.info(f"Kaspr returned {len(kaspr_result.phones)} phones but none with valid DACH prefix")
-                    enrichment_path.append("kaspr_filtered_non_dach")
-                    # Track filtered out phones
-                    track_phone_attempt(
-                        service="kaspr",
-                        phones_returned=kaspr_result.phones,
-                        dach_valid_phone=None,
-                        phone_type=None
-                    )
-            else:
-                # Track no phone returned
-                track_phone_attempt(
-                    service="kaspr",
-                    phones_returned=[],
-                    dach_valid_phone=None,
-                    phone_type=None
-                )
-
-            logger.info(f"Kaspr: {len(kaspr_result.emails)} emails, {len(kaspr_result.phones)} phones")
+            enrichment_path.append("using_best_candidate_no_phone")
+            logger.info(f"No phone found, using best candidate: {decision_maker.name}")
 
     # Step 7: Company Research - FREE sales intelligence
     logger.info("Researching company for sales brief...")
@@ -457,6 +445,144 @@ async def enrich_lead_test_mode(payload: WebhookPayload) -> EnrichmentResult:
     NO paid API credits consumed.
     """
     return await enrich_lead(payload, skip_paid_apis=True)
+
+
+async def _try_enrich_candidate(
+    candidate: DecisionMaker,
+    linkedin_url: Optional[str],
+    company_name: str,
+    domain: Optional[str],
+    skip_paid_apis: bool,
+    enrichment_path: List[str]
+) -> tuple[Optional[PhoneResult], List[str]]:
+    """
+    Try to get phone number for a single candidate using FullEnrich and Kaspr.
+
+    Returns:
+        Tuple of (PhoneResult or None, list of collected emails)
+    """
+    phone_result: Optional[PhoneResult] = None
+    collected_emails: List[str] = []
+
+    if skip_paid_apis:
+        return None, []
+
+    if not candidate.first_name or not candidate.last_name:
+        logger.info(f"Skipping enrichment - incomplete name: {candidate.name}")
+        return None, []
+
+    # Try FullEnrich first (10 credits/phone)
+    logger.info(f"Trying FullEnrich for {candidate.name}...")
+    fullenrich = FullEnrichClient()
+
+    fe_result = await fullenrich.enrich(
+        first_name=candidate.first_name,
+        last_name=candidate.last_name,
+        company_name=company_name,
+        domain=domain,
+        linkedin_url=linkedin_url
+    )
+
+    if fe_result:
+        enrichment_path.append("fullenrich")
+        collected_emails.extend(fe_result.emails)
+
+        # Check if FullEnrich found LinkedIn (if we didn't have it)
+        if not linkedin_url and fe_result.linkedin_url:
+            linkedin_url = fe_result.linkedin_url
+            candidate.linkedin_url = linkedin_url
+            enrichment_path.append("fullenrich_linkedin_found")
+            logger.info(f"FullEnrich found LinkedIn: {linkedin_url}")
+
+        # Check if FullEnrich found phones
+        if fe_result.phones:
+            fe_phone = _get_best_phone(fe_result.phones)
+            if fe_phone:
+                phone_result = fe_phone
+                enrichment_path.append("fullenrich_phone_found")
+                logger.info(f"FullEnrich found phone: {phone_result.number}")
+                track_phone_attempt(
+                    service="fullenrich",
+                    phones_returned=fe_result.phones,
+                    dach_valid_phone=fe_phone,
+                    phone_type=fe_phone.type.value
+                )
+            else:
+                logger.info(f"FullEnrich returned {len(fe_result.phones)} phones but none with valid DACH prefix")
+                enrichment_path.append("fullenrich_filtered_non_dach")
+                track_phone_attempt(
+                    service="fullenrich",
+                    phones_returned=fe_result.phones,
+                    dach_valid_phone=None,
+                    phone_type=None
+                )
+        else:
+            track_phone_attempt(
+                service="fullenrich",
+                phones_returned=[],
+                dach_valid_phone=None,
+                phone_type=None
+            )
+
+        logger.info(f"FullEnrich: {len(fe_result.emails)} emails, {len(fe_result.phones)} phones")
+
+    # Try Kaspr if no phone yet OR only landline found
+    need_kaspr = (
+        not phone_result or
+        (phone_result and phone_result.type == PhoneType.LANDLINE)
+    )
+
+    if need_kaspr and linkedin_url:
+        reason = "no phone yet" if not phone_result else "only landline, trying for mobile"
+        logger.info(f"Trying Kaspr ({reason}) for {candidate.name}...")
+        kaspr = KasprClient()
+
+        kaspr_result = await kaspr.enrich_by_linkedin(
+            linkedin_url=linkedin_url,
+            name=candidate.name
+        )
+
+        if kaspr_result:
+            enrichment_path.append("kaspr")
+            collected_emails.extend(kaspr_result.emails)
+
+            if kaspr_result.phones:
+                kaspr_phone = _get_best_phone(kaspr_result.phones)
+                if kaspr_phone:
+                    if not phone_result:
+                        phone_result = kaspr_phone
+                        enrichment_path.append("kaspr_phone_found")
+                    elif kaspr_phone.type == PhoneType.MOBILE and phone_result.type != PhoneType.MOBILE:
+                        logger.info(f"Kaspr found mobile, replacing landline")
+                        phone_result = kaspr_phone
+                        enrichment_path.append("kaspr_mobile_upgrade")
+                    logger.info(f"Kaspr found phone: {kaspr_phone.number} ({kaspr_phone.type.value})")
+                    track_phone_attempt(
+                        service="kaspr",
+                        phones_returned=kaspr_result.phones,
+                        dach_valid_phone=kaspr_phone,
+                        phone_type=kaspr_phone.type.value
+                    )
+                else:
+                    logger.info(f"Kaspr returned {len(kaspr_result.phones)} phones but none with valid DACH prefix")
+                    enrichment_path.append("kaspr_filtered_non_dach")
+                    track_phone_attempt(
+                        service="kaspr",
+                        phones_returned=kaspr_result.phones,
+                        dach_valid_phone=None,
+                        phone_type=None
+                    )
+            else:
+                track_phone_attempt(
+                    service="kaspr",
+                    phones_returned=[],
+                    dach_valid_phone=None,
+                    phone_type=None
+                )
+
+            logger.info(f"Kaspr: {len(kaspr_result.emails)} emails, {len(kaspr_result.phones)} phones")
+
+    return phone_result, collected_emails
 
 
 def _get_best_phone(phones: List[PhoneResult]) -> Optional[PhoneResult]:

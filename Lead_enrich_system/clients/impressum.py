@@ -21,6 +21,23 @@ class ImpressumResult:
     success: bool = False
 
 
+@dataclass
+class TeamMember:
+    """A team member found on the company website."""
+    name: str
+    title: Optional[str] = None
+    email: Optional[str] = None
+    source_url: str = ""
+
+
+@dataclass
+class TeamPageResult:
+    """Result from team page scraping."""
+    members: List[TeamMember]
+    source_url: Optional[str] = None
+    success: bool = False
+
+
 class ImpressumScraper:
     """
     Scrapes Impressum pages for contact information.
@@ -74,6 +91,232 @@ class ImpressumScraper:
                     return result
 
         return None
+
+    async def scrape_team_page(
+        self,
+        company_name: str,
+        domain: Optional[str] = None,
+        job_category: Optional[str] = None
+    ) -> Optional[TeamPageResult]:
+        """
+        Scrape company team/about page to find verified employees.
+        These are VERIFIED contacts since they're on the company website.
+
+        Args:
+            company_name: Company name
+            domain: Company domain
+            job_category: Job category to prioritize relevant contacts
+
+        Returns:
+            TeamPageResult with list of team members
+        """
+        if not domain:
+            logger.info("No domain for team page scraping")
+            return None
+
+        # Team page URLs to try
+        clean_domain = domain.replace("www.", "")
+        team_urls = [
+            f"https://www.{clean_domain}/team",
+            f"https://{clean_domain}/team",
+            f"https://www.{clean_domain}/ueber-uns",
+            f"https://{clean_domain}/ueber-uns",
+            f"https://www.{clean_domain}/about",
+            f"https://{clean_domain}/about",
+            f"https://www.{clean_domain}/unternehmen",
+            f"https://{clean_domain}/unternehmen",
+            f"https://www.{clean_domain}/mitarbeiter",
+            f"https://{clean_domain}/mitarbeiter",
+            f"https://www.{clean_domain}/ansprechpartner",
+            f"https://{clean_domain}/ansprechpartner",
+            f"https://www.{clean_domain}/kontakt",
+            f"https://{clean_domain}/kontakt",
+        ]
+
+        all_members = []
+
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        ) as client:
+            # Try max 3 URLs to avoid too many requests
+            tried = 0
+            for url in team_urls:
+                if tried >= 3:
+                    break
+
+                try:
+                    response = await client.get(url)
+                    if response.status_code != 200:
+                        continue
+
+                    tried += 1
+                    soup = BeautifulSoup(response.text, "lxml")
+                    members = self._extract_team_members(soup, url)
+
+                    if members:
+                        all_members.extend(members)
+                        logger.info(f"Team page {url}: found {len(members)} members")
+
+                except Exception as e:
+                    logger.debug(f"Team page failed: {url} - {e}")
+                    continue
+
+        if not all_members:
+            logger.info(f"No team members found for {company_name}")
+            return None
+
+        # Remove duplicates by name
+        seen_names = set()
+        unique_members = []
+        for m in all_members:
+            name_lower = m.name.lower()
+            if name_lower not in seen_names:
+                seen_names.add(name_lower)
+                unique_members.append(m)
+
+        # Prioritize HR/Recruiting contacts, then job-category relevant
+        prioritized = self._prioritize_team_members(unique_members, job_category)
+
+        logger.info(f"Team page scraping: {len(prioritized)} unique members for {company_name}")
+
+        return TeamPageResult(
+            members=prioritized[:5],  # Max 5 members
+            source_url=team_urls[0] if all_members else None,
+            success=len(prioritized) > 0
+        )
+
+    def _extract_team_members(self, soup: BeautifulSoup, source_url: str) -> List[TeamMember]:
+        """Extract team member names and titles from HTML."""
+        members = []
+
+        # Common patterns for team member sections
+        # Look for structured data (cards, divs with name+title)
+
+        # Pattern 1: Look for elements with common class names
+        team_containers = soup.find_all(['div', 'section', 'article'], class_=re.compile(
+            r'team|member|employee|staff|person|profile|card', re.IGNORECASE
+        ))
+
+        for container in team_containers:
+            name = None
+            title = None
+
+            # Try to find name in h2, h3, h4, strong, or class containing "name"
+            name_elem = container.find(['h2', 'h3', 'h4', 'strong'], class_=re.compile(r'name', re.IGNORECASE))
+            if not name_elem:
+                name_elem = container.find(['h2', 'h3', 'h4', 'strong'])
+
+            if name_elem:
+                name = name_elem.get_text(strip=True)
+
+            # Try to find title in p, span, or class containing "title", "position", "role"
+            title_elem = container.find(['p', 'span', 'div'], class_=re.compile(
+                r'title|position|role|job|funktion', re.IGNORECASE
+            ))
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+
+            if name and self._is_valid_name(name):
+                members.append(TeamMember(
+                    name=name,
+                    title=title,
+                    source_url=source_url
+                ))
+
+        # Pattern 2: Look for text patterns like "Name - Title" or "Name, Title"
+        if not members:
+            text = soup.get_text(separator="\n")
+            # Pattern: German names with titles
+            patterns = [
+                # "Max Müller - Geschäftsführer"
+                r'([A-ZÄÖÜ][a-zäöüß]+\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+)?)\s*[-–|]\s*([A-Za-zäöüÄÖÜß\s]+(?:leiter|manager|director|head|chef|führer|inhaber))',
+                # "Geschäftsführer: Max Müller"
+                r'(Geschäftsführer|CEO|Inhaber|Personalleiter|HR\s*Manager)[:\s]+([A-ZÄÖÜ][a-zäöüß]+\s+[A-ZÄÖÜ][a-zäöüß]+)',
+            ]
+
+            for pattern in patterns:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                for match in matches[:5]:  # Limit matches
+                    if len(match) == 2:
+                        name, title = match[0], match[1]
+                        # Check which one is the name
+                        if self._is_valid_name(name):
+                            members.append(TeamMember(name=name, title=title, source_url=source_url))
+                        elif self._is_valid_name(title):
+                            members.append(TeamMember(name=title, title=name, source_url=source_url))
+
+        return members
+
+    def _is_valid_name(self, text: str) -> bool:
+        """Check if text looks like a valid person name."""
+        if not text or len(text) < 4 or len(text) > 50:
+            return False
+
+        # Must have at least 2 words (first + last name)
+        words = text.split()
+        if len(words) < 2:
+            return False
+
+        # Filter out obvious non-names
+        invalid_patterns = [
+            'kontakt', 'email', 'telefon', 'adresse', 'impressum',
+            'gmbh', 'ag', 'kg', 'mbh', 'ohg', 'ug',
+            'straße', 'str.', 'platz', 'weg',
+            '@', 'www', 'http', '.de', '.com',
+            'mehr erfahren', 'weiterlesen', 'zum profil'
+        ]
+
+        text_lower = text.lower()
+        if any(p in text_lower for p in invalid_patterns):
+            return False
+
+        # First word should start with uppercase
+        if not words[0][0].isupper():
+            return False
+
+        return True
+
+    def _prioritize_team_members(
+        self,
+        members: List[TeamMember],
+        job_category: Optional[str]
+    ) -> List[TeamMember]:
+        """Prioritize team members by relevance."""
+        hr_keywords = ['personal', 'hr', 'recruiting', 'human', 'bewerbung']
+        exec_keywords = ['geschäftsführ', 'ceo', 'inhaber', 'founder', 'gründer', 'managing']
+
+        # Category-specific keywords
+        category_keywords = {}
+        if job_category:
+            cat_lower = job_category.lower()
+            if 'it' in cat_lower or 'tech' in cat_lower or 'software' in cat_lower:
+                category_keywords = ['cto', 'it', 'tech', 'entwickl', 'engineer']
+            elif 'sales' in cat_lower or 'vertrieb' in cat_lower:
+                category_keywords = ['sales', 'vertrieb', 'verkauf']
+            elif 'marketing' in cat_lower:
+                category_keywords = ['marketing', 'cmo', 'kommunikation']
+
+        def score(member: TeamMember) -> int:
+            s = 0
+            title_lower = (member.title or "").lower()
+
+            # HR/Recruiting = highest priority
+            if any(k in title_lower for k in hr_keywords):
+                s += 100
+
+            # Category-relevant
+            if category_keywords and any(k in title_lower for k in category_keywords):
+                s += 50
+
+            # Executives = fallback
+            if any(k in title_lower for k in exec_keywords):
+                s += 25
+
+            return s
+
+        return sorted(members, key=score, reverse=True)
 
     async def _google_search(
         self,
@@ -227,6 +470,10 @@ class ImpressumScraper:
         elif len(cleaned) >= 10 and not cleaned.startswith('+'):
             # Assume German number without prefix, add +49
             cleaned = '+49' + cleaned
+
+        # FIX: Remove duplicate country codes (+4949, +4943, +4941)
+        # This happens when source has formats like "+49 (0)49 89..." or "0049 49 89..."
+        cleaned = re.sub(r'^\+49(49|43|41)', r'+\1', cleaned)
 
         return cleaned
 
