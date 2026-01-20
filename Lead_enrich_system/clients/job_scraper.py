@@ -9,10 +9,17 @@ Goal: Find Ansprechpartner (contact person) with:
 - Name (real person, not generic)
 - Email (personal, not info@)
 - Phone number
+
+Safety:
+- Max 2MB response size
+- 10 second timeout
+- Max 2 concurrent Playwright browsers (RAM limit)
+- Text extraction limited to 20KB
 """
 
 import re
 import logging
+import asyncio
 from typing import Optional, List
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -21,6 +28,10 @@ import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# Semaphore to limit concurrent Playwright browsers (RAM protection)
+# Max 2 browsers at once - each uses ~100-200MB RAM
+_playwright_semaphore = asyncio.Semaphore(2)
 
 # Sites that need JavaScript rendering
 JS_HEAVY_SITES = [
@@ -110,6 +121,8 @@ class JobUrlScraper:
 
     async def _scrape_with_httpx(self, url: str) -> Optional[str]:
         """Fast scraping with httpx (no JS rendering)."""
+        MAX_SIZE = 2 * 1024 * 1024  # 2MB max - job postings are never bigger
+
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout,
@@ -120,39 +133,69 @@ class JobUrlScraper:
                     'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
                 }
             ) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                return response.text
+                # Stream response to check size before loading fully
+                async with client.stream('GET', url) as response:
+                    response.raise_for_status()
+
+                    # Check content-length header if available
+                    content_length = response.headers.get('content-length')
+                    if content_length and int(content_length) > MAX_SIZE:
+                        logger.warning(f"Response too large ({content_length} bytes), skipping")
+                        return None
+
+                    # Read with size limit
+                    chunks = []
+                    total_size = 0
+                    async for chunk in response.aiter_bytes():
+                        total_size += len(chunk)
+                        if total_size > MAX_SIZE:
+                            logger.warning(f"Response exceeded {MAX_SIZE} bytes, truncating")
+                            break
+                        chunks.append(chunk)
+
+                    return b''.join(chunks).decode('utf-8', errors='ignore')
+
         except Exception as e:
             logger.warning(f"httpx scraping failed: {e}")
             return None
 
     async def _scrape_with_playwright(self, url: str) -> Optional[str]:
         """JS-rendering with Playwright (slower but works for dynamic sites)."""
+        MAX_HTML_SIZE = 2 * 1024 * 1024  # 2MB max
+
         try:
             from playwright.async_api import async_playwright
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                try:
-                    context = await browser.new_context(
-                        viewport={'width': 1280, 'height': 720},
-                        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    )
-                    page = await context.new_page()
+            # Use semaphore to limit concurrent browsers (RAM protection)
+            async with _playwright_semaphore:
+                logger.info("Acquired Playwright semaphore, starting browser...")
 
-                    # Navigate with timeout
-                    await page.goto(url, wait_until='domcontentloaded', timeout=self.timeout * 1000)
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    try:
+                        context = await browser.new_context(
+                            viewport={'width': 1280, 'height': 720},
+                            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                        )
+                        page = await context.new_page()
 
-                    # Wait a bit for dynamic content
-                    await page.wait_for_timeout(1500)
+                        # Navigate with timeout
+                        await page.goto(url, wait_until='domcontentloaded', timeout=self.timeout * 1000)
 
-                    # Get page content
-                    html = await page.content()
-                    return html
+                        # Wait a bit for dynamic content
+                        await page.wait_for_timeout(1500)
 
-                finally:
-                    await browser.close()
+                        # Get page content with size limit
+                        html = await page.content()
+
+                        if len(html) > MAX_HTML_SIZE:
+                            logger.warning(f"Playwright HTML too large ({len(html)} bytes), truncating")
+                            html = html[:MAX_HTML_SIZE]
+
+                        return html
+
+                    finally:
+                        await browser.close()
 
         except ImportError:
             logger.warning("Playwright not installed. Run: pip install playwright && playwright install chromium")
