@@ -13,9 +13,10 @@ from models import (
 from llm_parser import parse_job_posting
 from clients.kaspr import KasprClient
 from clients.fullenrich import FullEnrichClient
-from clients.impressum import ImpressumScraper, TeamMember
+from clients.impressum import ImpressumScraper
 from clients.linkedin_search import LinkedInSearchClient
 from clients.company_research import CompanyResearcher
+from clients.job_scraper import JobUrlScraper, ScrapedContact
 from utils.stats import track_phone_attempt
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,108 @@ def _is_valid_dach_phone(number: str) -> bool:
     return False
 
 
+def _extract_name_from_email(email: str) -> Optional[str]:
+    """
+    Extract a real person name from email address.
+
+    Examples:
+        hans.hermann@amasol.de -> Hans Hermann
+        mohit.popli@amasol.de -> Mohit Popli
+        m.mueller@company.de -> None (too short)
+        info@company.de -> None (generic)
+    """
+    if not email or '@' not in email:
+        return None
+
+    local_part = email.split('@')[0].lower()
+
+    # Skip generic email addresses
+    generic_patterns = [
+        'info', 'kontakt', 'contact', 'mail', 'office', 'hello', 'team',
+        'support', 'service', 'sales', 'marketing', 'hr', 'personal',
+        'bewerbung', 'karriere', 'jobs', 'admin', 'webmaster', 'noreply'
+    ]
+    if local_part in generic_patterns:
+        return None
+
+    # Try to extract name parts
+    # Pattern 1: firstname.lastname
+    if '.' in local_part:
+        parts = local_part.split('.')
+        if len(parts) >= 2:
+            first = parts[0]
+            last = parts[-1]
+
+            # Skip if parts are too short (initials like m.mueller)
+            if len(first) < 2 or len(last) < 2:
+                return None
+
+            # Skip if contains numbers
+            if any(c.isdigit() for c in first + last):
+                return None
+
+            # Capitalize properly
+            first_name = first.capitalize()
+            last_name = last.capitalize()
+
+            return f"{first_name} {last_name}"
+
+    # Pattern 2: firstnamelastname (no separator) - harder to parse, skip
+    return None
+
+
+def _is_valid_person_name(name: str) -> bool:
+    """
+    Quick validation if a string looks like a real person name.
+    Used to filter out HTML garbage before using as decision maker.
+    """
+    if not name:
+        return False
+
+    # Clean whitespace
+    name = ' '.join(name.split())
+
+    # Check for HTML artifacts
+    if '\t' in name or '\n' in name:
+        return False
+
+    # Must have at least 2 words
+    words = name.split()
+    if len(words) < 2:
+        return False
+
+    # Length check (typical names are 5-40 chars)
+    if len(name) < 5 or len(name) > 40:
+        return False
+
+    # Filter out job titles and garbage
+    invalid_patterns = [
+        'präsident', 'vizepräsident', 'vize',
+        'teamleiter', 'abteilungsleiter', 'bereichsleiter', 'gruppenleiter',
+        'geschäftsführ', 'geschäftsleitung',
+        'vorstand', 'aufsichtsrat', 'beirat',
+        'direktor', 'director', 'manager', 'leiter', 'leiterin',
+        'chef', 'chefin', 'head of', 'senior', 'junior',
+        'ceo', 'cto', 'cfo', 'coo', 'cmo', 'cio',
+        'und team', 'unser team', 'das team',
+        'kontakt', 'email', 'telefon', 'gmbh', 'ag', 'kg',
+    ]
+
+    name_lower = name.lower()
+    if any(p in name_lower for p in invalid_patterns):
+        return False
+
+    # Each word should be alphabetic and capitalized
+    for word in words[:2]:
+        clean = word.replace('-', '')
+        if not clean.isalpha():
+            return False
+        if not word[0].isupper():
+            return False
+
+    return True
+
+
 async def enrich_lead(
     payload: WebhookPayload,
     skip_paid_apis: bool = False
@@ -98,6 +201,31 @@ async def enrich_lead(
 
     parsed = await parse_job_posting(payload)
     logger.info(f"LLM extracted: domain={parsed.company_domain}, contact={parsed.contact_name}, email={parsed.contact_email}")
+
+    # Step 1a: Scrape original job URL for contact person (if URL provided)
+    scraped_contact: Optional[ScrapedContact] = None
+    if payload.url:
+        logger.info(f"Step 1a: Scraping job URL for contact: {payload.url}")
+        try:
+            job_scraper = JobUrlScraper(timeout=10)
+            scraped_contact = await job_scraper.scrape_contact(payload.url)
+
+            if scraped_contact:
+                enrichment_path.append("job_url_scraped")
+                logger.info(f"Job URL found contact: {scraped_contact.name} / {scraped_contact.email} (confidence: {scraped_contact.confidence:.2f})")
+
+                # If we found a better contact than LLM parsing, use it
+                if scraped_contact.name and not parsed.contact_name:
+                    parsed.contact_name = scraped_contact.name
+                    enrichment_path.append("contact_from_job_url")
+                if scraped_contact.email and not parsed.contact_email:
+                    parsed.contact_email = scraped_contact.email
+                    enrichment_path.append("email_from_job_url")
+            else:
+                enrichment_path.append("job_url_no_contact")
+        except Exception as e:
+            logger.warning(f"Job URL scraping failed: {e}")
+            enrichment_path.append("job_url_error")
 
     # Create company info from parsed data
     company_info = CompanyInfo(
@@ -155,6 +283,10 @@ async def enrich_lead(
     # Add Impressum emails to collection
     if impressum_result and impressum_result.emails:
         collected_emails.extend(impressum_result.emails)
+
+    # Add emails from scraped job URL
+    if scraped_contact and scraped_contact.email:
+        collected_emails.append(scraped_contact.email)
 
     # Step 3: Build candidate list for phone enrichment
     # Priority: 1. Contact from job posting 2. Team page 3. LinkedIn search
@@ -396,6 +528,33 @@ async def enrich_lead(
             decision_maker.email = personal_emails[0]
         elif not decision_maker.email:
             decision_maker.email = unique_emails[0]
+
+    # VALIDATION: Ensure decision maker has a valid real person name
+    if decision_maker and not _is_valid_person_name(decision_maker.name):
+        logger.warning(f"Decision maker name looks invalid: '{decision_maker.name}' - trying to extract from emails")
+        enrichment_path.append("invalid_name_detected")
+
+        # Try to extract name from collected emails
+        extracted_name = None
+        for email in unique_emails:
+            extracted_name = _extract_name_from_email(email)
+            if extracted_name:
+                logger.info(f"Extracted name from email: {extracted_name}")
+                break
+
+        if extracted_name:
+            # Update decision maker with extracted name
+            names = extracted_name.split()
+            decision_maker.name = extracted_name
+            decision_maker.first_name = names[0] if names else ""
+            decision_maker.last_name = " ".join(names[1:]) if len(names) > 1 else ""
+            enrichment_path.append("name_from_email")
+            logger.info(f"Updated decision maker name to: {extracted_name}")
+        else:
+            # No valid name found - clear the decision maker
+            logger.warning("Could not extract valid name from emails - clearing decision maker")
+            decision_maker = None
+            enrichment_path.append("no_valid_name_found")
 
     # Build result
     # Success if we have: personal phone OR company phone OR emails
@@ -699,8 +858,11 @@ async def _google_find_company_linkedin(
         return None
 
     async with httpx.AsyncClient(timeout=settings.api_timeout) as client:
-        # Search for company LinkedIn page
-        query = f'"{company_name}" site:linkedin.com/company'
+        # Search for company LinkedIn page - include domain if available for better results
+        if domain:
+            query = f'"{company_name}" OR "{domain}" site:linkedin.com/company'
+        else:
+            query = f'"{company_name}" site:linkedin.com/company'
 
         url = "https://www.googleapis.com/customsearch/v1"
         params = {

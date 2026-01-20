@@ -209,14 +209,17 @@ class ImpressumScraper:
                 name_elem = container.find(['h2', 'h3', 'h4', 'strong'])
 
             if name_elem:
-                name = name_elem.get_text(strip=True)
+                # Clean extracted text: normalize whitespace
+                raw_text = name_elem.get_text(strip=True)
+                name = ' '.join(raw_text.split())  # Collapse all whitespace
 
             # Try to find title in p, span, or class containing "title", "position", "role"
             title_elem = container.find(['p', 'span', 'div'], class_=re.compile(
                 r'title|position|role|job|funktion', re.IGNORECASE
             ))
             if title_elem:
-                title = title_elem.get_text(strip=True)
+                raw_title = title_elem.get_text(strip=True)
+                title = ' '.join(raw_title.split())  # Collapse all whitespace
 
             if name and self._is_valid_name(name):
                 members.append(TeamMember(
@@ -254,6 +257,13 @@ class ImpressumScraper:
         if not text or len(text) < 4 or len(text) > 50:
             return False
 
+        # Reject if contains whitespace artifacts (tabs, multiple newlines)
+        if '\t' in text or '\n\n' in text or '  ' in text:
+            return False
+
+        # Clean the text (single newlines -> spaces)
+        text = ' '.join(text.split())
+
         # Must have at least 2 words (first + last name)
         words = text.split()
         if len(words) < 2:
@@ -272,9 +282,44 @@ class ImpressumScraper:
         if any(p in text_lower for p in invalid_patterns):
             return False
 
+        # Filter out job titles that are NOT person names
+        job_title_patterns = [
+            'präsident', 'vizepräsident', 'vize',
+            'teamleiter', 'abteilungsleiter', 'bereichsleiter', 'gruppenleiter',
+            'geschäftsführ', 'geschäftsleitung',
+            'vorstand', 'aufsichtsrat', 'beirat',
+            'direktor', 'director',
+            'manager', 'leiter', 'leiterin',
+            'chef', 'chefin',
+            'head of', 'senior', 'junior',
+            'assistent', 'assistentin', 'sekretär',
+            'mitarbeiter', 'angestellte',
+            'partner', 'gesellschafter',
+            'inhaber', 'inhaberin', 'eigentümer',
+            'gründer', 'gründerin', 'founder',
+            'ceo', 'cto', 'cfo', 'coo', 'cmo', 'cio',
+            'managing', 'executive', 'officer',
+            'consultant', 'berater', 'beraterin',
+            'entwickler', 'developer', 'engineer',
+            'und team', 'unser team', 'das team',
+        ]
+
+        # Check if text is primarily a job title (not a real name)
+        if any(p in text_lower for p in job_title_patterns):
+            return False
+
         # First word should start with uppercase
         if not words[0][0].isupper():
             return False
+
+        # Additional check: both words should look like names (capitalized, letters only)
+        for word in words[:2]:  # Check at least first two words
+            # Allow hyphens in names (e.g., "Hans-Peter")
+            clean_word = word.replace('-', '')
+            if not clean_word.isalpha():
+                return False
+            if not word[0].isupper():
+                return False
 
         return True
 
