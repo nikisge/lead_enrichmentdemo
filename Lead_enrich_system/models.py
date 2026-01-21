@@ -36,6 +36,7 @@ class ParsedJobPosting(BaseModel):
     company_domain: Optional[str] = None
     contact_name: Optional[str] = None
     contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None  # Phone from job posting
     target_titles: List[str] = Field(default_factory=list)
     department: Optional[str] = None
     location: Optional[str] = None

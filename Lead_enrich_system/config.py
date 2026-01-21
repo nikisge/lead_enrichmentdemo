@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     kaspr_api_key: str = ""
     fullenrich_api_key: str = ""
 
+    # OpenRouter for multi-model LLM access
+    openrouter_api_key: str = ""
+
     # Optional: Google Custom Search
     google_api_key: str = ""
     google_cse_id: str = ""

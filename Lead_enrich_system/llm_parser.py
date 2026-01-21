@@ -15,6 +15,7 @@ Extrahiere strukturierte Informationen aus der Stellenanzeige.
 Wichtig:
 - Suche nach genannten Ansprechpartnern (oft am Ende: "Ihr Ansprechpartner", "Kontakt", "Bewerbung an")
 - Extrahiere E-Mail-Adressen falls vorhanden
+- Extrahiere Telefonnummern falls vorhanden (Format: +49, 0049, oder 0xxx)
 - Identifiziere die Firma und versuche die Domain abzuleiten (aus Email oder Website-Erwähnungen)
 - Bestimme relevante Titel für Entscheider (HR, Personal, Geschäftsführung)
 - Wenn eine Website wie www.firma.de erwähnt wird, nutze "firma.de" als Domain
@@ -25,6 +26,7 @@ Antworte NUR mit validem JSON im folgenden Format (keine anderen Texte):
     "company_domain": "firma.de oder null",
     "contact_name": "Vorname Nachname oder null",
     "contact_email": "email@firma.de oder null",
+    "contact_phone": "+49 123 456789 oder null",
     "target_titles": ["HR Manager", "Personalleiter"],
     "department": "HR/Personal/IT/etc oder null",
     "location": "Stadt, Land oder null"
@@ -95,6 +97,18 @@ def _regex_parse(payload: WebhookPayload) -> ParsedJobPosting:
     emails = re.findall(email_pattern, description)
     contact_email = emails[0] if emails else None
 
+    # Extract phone numbers (German formats)
+    phone_pattern = r'(?:\+49|0049|0)\s*[\d\s\-/()]{8,20}'
+    phones = re.findall(phone_pattern, description)
+    contact_phone = None
+    if phones:
+        # Clean and take first valid phone
+        for phone in phones:
+            cleaned = re.sub(r'[^\d+]', '', phone)
+            if len(cleaned) >= 10:
+                contact_phone = phone.strip()
+                break
+
     # Extract domain from email, website mention, or company name
     domain = None
 
@@ -135,6 +149,7 @@ def _regex_parse(payload: WebhookPayload) -> ParsedJobPosting:
         company_domain=domain,
         contact_name=contact_name,
         contact_email=contact_email,
+        contact_phone=contact_phone,
         target_titles=_get_default_titles(payload.title),
         department=_detect_department(payload.title, payload.category),
         location=payload.location
